@@ -1,23 +1,43 @@
+
 import dash
 from dash import html, dcc, Input, Output, State
 import dash_bootstrap_components as dbc
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import numpy as np
-from sklearn.linear_model import LinearRegression
+
+from components.charts import (
+    create_category_sales_chart,
+    create_region_heatmap,
+    create_sales_evolution_chart,
+    create_sales_forecast_chart,
+    create_top_products_chart,
+    create_trend_analysis_chart,
+)
+from components.filters import (
+    create_category_filter,
+    create_date_range_filter,
+    create_region_filter,
+)
+from components.kpi_cards import create_kpi_card
+from components.tables import create_data_table
+from utils.analytics import (
+    calculate_kpis,
+    get_region_heatmap_data,
+    get_sales_by_category,
+    get_sales_evolution,
+    get_sales_forecast,
+    get_top_products,
+    get_trend_analysis,
+)
+from utils.data_processor import load_data, process_data
+from utils.cache import get_from_cache, set_to_cache, get_cache_key
 
 # Inicializar app
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 app.title = "Sales Analytics Dashboard"
 
-# Carregar dados
-df = pd.read_csv('data/sales_data.csv', parse_dates=['data'])
-
-# Tratamento inicial dos dados
-df['mes'] = df['data'].dt.to_period('M').astype(str)
-df['ano'] = df['data'].dt.year
+# Carregar e processar dados
+df = load_data('data/sales_data.csv')
+df = process_data(df)
 
 # Layout
 app.layout = dbc.Container([
@@ -31,35 +51,9 @@ app.layout = dbc.Container([
     
     # Filtros
     dbc.Row([
-        dbc.Col([
-            html.Label("Período:"),
-            dcc.DatePickerRange(
-                id='date-range',
-                start_date=df['data'].min().date(),
-                end_date=df['data'].max().date(),
-                display_format='DD/MM/YYYY'
-            )
-        ], md=4),
-        dbc.Col([
-            html.Label("Categoria:"),
-            dcc.Dropdown(
-                id='category-filter',
-                options=[{'label': 'Todas', 'value': 'all'}] + 
-                        [{'label': cat, 'value': cat} for cat in df['categoria'].unique()],
-                value='all',
-                clearable=False
-            )
-        ], md=4),
-        dbc.Col([
-            html.Label("Região:"),
-            dcc.Dropdown(
-                id='region-filter',
-                options=[{'label': 'Todas', 'value': 'all'}] + 
-                        [{'label': reg, 'value': reg} for reg in df['regiao'].unique()],
-                value='all',
-                clearable=False
-            )
-        ], md=4)
+        dbc.Col([html.Label("Período:"), create_date_range_filter(df)], md=4),
+        dbc.Col([html.Label("Categoria:"), create_category_filter(df)], md=4),
+        dbc.Col([html.Label("Região:"), create_region_filter(df)], md=4)
     ], className="mb-4"),
 
     dcc.Store(id='filtered-data-store'),
@@ -82,6 +76,12 @@ app.layout = dbc.Container([
     dbc.Row([
         dbc.Col(dcc.Graph(id='sales-forecast-chart'), md=12),
     ]),
+    
+    # Tabela de Dados
+    dbc.Row([
+        dbc.Col(html.Div(id='data-table-container'), md=12)
+    ], className="mt-4"),
+
     dbc.Row([
         dbc.Col(dbc.Button("Exportar para Excel", id="export-excel-button", color="success", className="mt-4"), md=2),
     ])
@@ -99,6 +99,19 @@ app.layout = dbc.Container([
     ]
 )
 def update_filtered_data(start_date, end_date, category, region):
+    filters = {
+        'start_date': start_date,
+        'end_date': end_date,
+        'category': category,
+        'region': region
+    }
+    cache_key = get_cache_key(filters)
+    
+    cached_data = get_from_cache(cache_key)
+    
+    if cached_data is not None:
+        return cached_data.to_json(date_format='iso', orient='split')
+
     dff = df[
         (df['data'] >= pd.to_datetime(start_date)) & 
         (df['data'] <= pd.to_datetime(end_date))
@@ -109,8 +122,18 @@ def update_filtered_data(start_date, end_date, category, region):
     
     if region != 'all':
         dff = dff[dff['regiao'] == region]
+    
+    set_to_cache(cache_key, dff)
         
     return dff.to_json(date_format='iso', orient='split')
+
+@app.callback(
+    Output('data-table-container', 'children'),
+    Input('filtered-data-store', 'data')
+)
+def update_data_table(filtered_data):
+    dff = pd.read_json(filtered_data, orient='split')
+    return create_data_table(dff)
 
 @app.callback(
     Output('kpi-cards', 'children'),
@@ -118,15 +141,12 @@ def update_filtered_data(start_date, end_date, category, region):
 )
 def update_kpi_cards(filtered_data):
     dff = pd.read_json(filtered_data, orient='split')
+    receita_total, total_vendas, ticket_medio = calculate_kpis(dff)
     
-    receita_total = dff['receita'].sum()
-    total_vendas = dff['quantidade'].sum()
-    ticket_medio = receita_total / total_vendas if total_vendas > 0 else 0
-
     kpi_cards = [
-        dbc.Col(dbc.Card(dbc.CardBody([html.H4("Receita Total", className="card-title"), html.P(f"R$ {receita_total:,.2f}", className="card-text")])), md=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H4("Total de Vendas", className="card-title"), html.P(f"{total_vendas:,}", className="card-text")])), md=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H4("Ticket Médio", className="card-title"), html.P(f"R$ {ticket_medio:,.2f}", className="card-text")])), md=4),
+        create_kpi_card("Receita Total", receita_total),
+        create_kpi_card("Total de Vendas", total_vendas, formatter=lambda x: f"{x:,}"),
+        create_kpi_card("Ticket Médio", ticket_medio),
     ]
     return kpi_cards
 
@@ -136,10 +156,8 @@ def update_kpi_cards(filtered_data):
 )
 def update_sales_evolution_chart(filtered_data):
     dff = pd.read_json(filtered_data, orient='split')
-    sales_evolution = dff.groupby(dff['data'].dt.to_period('M').astype(str))['receita'].sum().reset_index()
-    sales_evolution_fig = px.line(sales_evolution, x='data', y='receita', title='Evolução de Vendas', labels={'data': 'Mês', 'receita': 'Receita'})
-    sales_evolution_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-    return sales_evolution_fig
+    sales_evolution = get_sales_evolution(dff)
+    return create_sales_evolution_chart(sales_evolution)
 
 @app.callback(
     Output('category-sales-chart', 'figure'),
@@ -147,10 +165,8 @@ def update_sales_evolution_chart(filtered_data):
 )
 def update_category_sales_chart(filtered_data):
     dff = pd.read_json(filtered_data, orient='split')
-    category_sales = dff.groupby('categoria')['receita'].sum().reset_index()
-    category_sales_fig = px.pie(category_sales, names='categoria', values='receita', title='Vendas por Categoria')
-    category_sales_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-    return category_sales_fig
+    category_sales = get_sales_by_category(dff)
+    return create_category_sales_chart(category_sales)
 
 @app.callback(
     Output('top-products-chart', 'figure'),
@@ -158,10 +174,8 @@ def update_category_sales_chart(filtered_data):
 )
 def update_top_products_chart(filtered_data):
     dff = pd.read_json(filtered_data, orient='split')
-    top_products = dff.groupby('produto')['receita'].sum().nlargest(10).sort_values(ascending=True).reset_index()
-    top_products_fig = px.bar(top_products, x='receita', y='produto', orientation='h', title='Top 10 Produtos por Receita')
-    top_products_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-    return top_products_fig
+    top_products = get_top_products(dff)
+    return create_top_products_chart(top_products)
 
 @app.callback(
     Output('region-heatmap', 'figure'),
@@ -169,10 +183,8 @@ def update_top_products_chart(filtered_data):
 )
 def update_region_heatmap(filtered_data):
     dff = pd.read_json(filtered_data, orient='split')
-    region_heatmap_data = dff.pivot_table(index='regiao', columns='categoria', values='receita', aggfunc='sum').fillna(0)
-    region_heatmap_fig = px.imshow(region_heatmap_data, title='Mapa de Calor: Receita por Região e Categoria', labels=dict(x="Categoria", y="Região", color="Receita"))
-    region_heatmap_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-    return region_heatmap_fig
+    region_heatmap_data = get_region_heatmap_data(dff)
+    return create_region_heatmap(region_heatmap_data)
 
 @app.callback(
     Output('trend-analysis-chart', 'figure'),
@@ -180,26 +192,8 @@ def update_region_heatmap(filtered_data):
 )
 def update_trend_analysis_chart(filtered_data):
     dff = pd.read_json(filtered_data, orient='split')
-    dff['data'] = pd.to_datetime(dff['data'])
-    dff_trend = dff.copy()
-    dff_trend['dias_desde_inicio'] = (dff_trend['data'] - dff_trend['data'].min()).dt.days
-    daily_sales = dff_trend.groupby('dias_desde_inicio')['receita'].sum().reset_index()
-    
-    trend_fig = go.Figure()
-    trend_fig.add_trace(go.Scatter(x=daily_sales['dias_desde_inicio'], y=daily_sales['receita'], mode='markers', name='Vendas Diárias'))
-
-    if len(daily_sales) > 1:
-        X = daily_sales[['dias_desde_inicio']]
-        y = daily_sales['receita']
-        model = LinearRegression()
-        model.fit(X, y)
-        trend_line = model.predict(X)
-        trend_fig.add_trace(go.Scatter(x=daily_sales['dias_desde_inicio'], y=trend_line, mode='lines', name='Linha de Tendência', line=dict(color='red')))
-
-    trend_fig.update_layout(title='Análise de Tendência de Vendas', xaxis_title='Dias desde o Início do Período', yaxis_title='Receita')
-    trend_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-
-    return trend_fig
+    daily_sales, trend_line = get_trend_analysis(dff)
+    return create_trend_analysis_chart(daily_sales, trend_line)
 
 @app.callback(
     Output('sales-forecast-chart', 'figure'),
@@ -207,36 +201,8 @@ def update_trend_analysis_chart(filtered_data):
 )
 def update_sales_forecast_chart(filtered_data):
     dff = pd.read_json(filtered_data, orient='split')
-    dff['data'] = pd.to_datetime(dff['data'])
-    dff_trend = dff.copy()
-    dff_trend['dias_desde_inicio'] = (dff_trend['data'] - dff_trend['data'].min()).dt.days
-    daily_sales = dff_trend.groupby('dias_desde_inicio')['receita'].sum().reset_index()
-    
-    forecast_fig = go.Figure()
-    forecast_fig.add_trace(go.Scatter(x=daily_sales['dias_desde_inicio'], y=daily_sales['receita'], mode='markers', name='Vendas Diárias'))
-
-    if len(daily_sales) > 1:
-        X = daily_sales[['dias_desde_inicio']]
-        y = daily_sales['receita']
-        model = LinearRegression()
-        model.fit(X, y)
-        
-        # Prever próximos 30 dias
-        future_days = np.arange(daily_sales['dias_desde_inicio'].max() + 1, daily_sales['dias_desde_inicio'].max() + 31).reshape(-1, 1)
-        future_sales = model.predict(future_days)
-        
-        # Linha de tendência atual
-        trend_line = model.predict(X)
-        forecast_fig.add_trace(go.Scatter(x=daily_sales['dias_desde_inicio'], y=trend_line, mode='lines', name='Linha de Tendência', line=dict(color='red')))
-        
-        # Linha de previsão
-        forecast_fig.add_trace(go.Scatter(x=future_days.flatten(), y=future_sales, mode='lines', name='Previsão (30 dias)', line=dict(color='green', dash='dash')))
-
-
-    forecast_fig.update_layout(title='Previsão de Vendas (Próximos 30 dias)', xaxis_title='Dias desde o Início do Período', yaxis_title='Receita')
-    forecast_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-
-    return forecast_fig
+    daily_sales, trend_line, future_days, future_sales = get_sales_forecast(dff)
+    return create_sales_forecast_chart(daily_sales, trend_line, future_days, future_sales)
 
 @app.callback(
     Output("export-excel-button", "n_clicks"),
